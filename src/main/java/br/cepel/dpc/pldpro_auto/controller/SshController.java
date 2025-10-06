@@ -4,8 +4,10 @@ import br.cepel.dpc.pldpro_auto.application.SshAccessUseCase;
 import br.cepel.dpc.pldpro_auto.dto.AccessHostRequest;
 import br.cepel.dpc.pldpro_auto.dto.AccessHostResponse;
 import br.cepel.dpc.pldpro_auto.dto.MultiAccessHostRequest;
+import br.cepel.dpc.pldpro_auto.infrastructure.service.ICasoService;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
 import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -25,6 +27,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 @RestController
 @RequestMapping("/v1/ssh")
@@ -32,6 +35,9 @@ import java.util.stream.Collectors;
 public class SshController {
 
     private final SshAccessUseCase useCase;
+
+    @Autowired
+    private ICasoService casoService;
 
     private static final int MAX_PARALLELISM = 20;
 
@@ -211,7 +217,80 @@ public class SshController {
                     .map(CompletableFuture::join)
                     .collect(Collectors.toList());
 
-            return ResponseEntity.ok(results);
+            // 3) agora que TODAS terminaram, executa em paralelo "cat <path>/pid.lock" para cada path
+            List<CompletableFuture<AccessHostResponse>> catFutures = IntStream.range(0, paths.size())
+                    .mapToObj(i -> {
+                        final int idx = i;
+                        final String path = paths.get(idx);
+                        return CompletableFuture.supplyAsync(() -> {
+                            // monta o comando cat com proteção para paths com espaços
+                            String pidPath = path.endsWith("/") ? path + "pid.lock" : path + "/pid.lock";
+                            String catCmd = "cat " + "\"" + pidPath + "\"";
+
+                            AccessHostRequest catReq = new AccessHostRequest(
+                                    req.host(),
+                                    req.port(),
+                                    req.user(),
+                                    catCmd,
+                                    false,   // cat não precisa de bootstrap
+                                    null     // sem senha
+                            );
+
+                            try {
+                                AccessHostResponse catResp = useCase.execute(catReq);
+                                AccessHostResponse original = results.get(idx);
+
+                                // junta os stdout: original + separador + conteúdo de pid.lock
+                                StringBuilder newStdout = new StringBuilder();
+//                                if (original.stdout() != null && !original.stdout().isEmpty()) {
+//                                    newStdout.append(original.stdout());
+//                                }
+                                newStdout.append("\n--- PID.LOCK ---\n");
+                                newStdout.append(catResp.stdout() == null ? "" : catResp.stdout());
+
+                                casoService.create(catResp.stdout());
+
+                                // junta stderr (original + potencial erro do cat)
+                                StringBuilder newStderr = new StringBuilder();
+                                if (original.stderr() != null && !original.stderr().isEmpty()) {
+                                    newStderr.append(original.stderr());
+                                }
+                                if (catResp.stderr() != null && !catResp.stderr().isEmpty()) {
+                                    if (newStderr.length() > 0) newStderr.append("\n");
+                                    newStderr.append("CAT_ERR: ").append(catResp.stderr());
+                                }
+
+                                return new AccessHostResponse(
+                                        original.exitCode(),
+                                        newStdout.toString(),
+                                        newStderr.toString()
+                                );
+                            } catch (Exception e) {
+                                // se o cat falhar (ex: pid.lock não existe), devolve original com indicação de erro no stderr
+                                AccessHostResponse original = results.get(idx);
+                                String catErr = e.getMessage() == null ? e.toString() : e.getMessage();
+                                String newStdout = (original.stdout() == null ? "" : original.stdout()) +
+                                        "\n--- PID.LOCK ---\n";
+                                String newStderr = (original.stderr() == null ? "" : original.stderr());
+                                if (!newStderr.isEmpty()) newStderr += "\n";
+                                newStderr += "CAT_EXCEPTION: " + catErr;
+
+                                return new AccessHostResponse(
+                                        original.exitCode(),
+                                        newStdout,
+                                        newStderr
+                                );
+                            }
+                        }, executor);
+                    })
+                    .collect(Collectors.toList());
+
+            // 4) espera todos os cats terminarem e coleta resultados finais na mesma ordem
+            List<AccessHostResponse> finalResults = catFutures.stream()
+                    .map(CompletableFuture::join)
+                    .collect(Collectors.toList());
+
+            return ResponseEntity.ok(finalResults);
 
         } finally {
             executor.shutdown();
