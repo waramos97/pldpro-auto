@@ -4,6 +4,9 @@ import br.cepel.dpc.pldpro_auto.domain.Caso;
 import br.cepel.dpc.pldpro_auto.domain.repository.ICasoRepository;
 import br.cepel.dpc.pldpro_auto.infrastructure.enums.StatusEnum;
 import br.cepel.dpc.pldpro_auto.infrastructure.ssh.SshClientService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.stereotype.Service;
 
@@ -16,125 +19,102 @@ import java.util.concurrent.ScheduledFuture;
 @Service
 public class MonitoringService {
 
-    private final ThreadPoolTaskScheduler scheduler;
+    private static final Logger log = LoggerFactory.getLogger(MonitoringService.class);
+
+
+    @Autowired
+    private ThreadPoolTaskScheduler scheduler;
+
+    @Autowired
+    private ICasoRepository casoRepository;
+
+    @Autowired
+    private SshClientService sshClientService;
+
     private final Map<Long, ScheduledFuture<?>> tasks = new ConcurrentHashMap<>();
-    private final ICasoRepository casoRepository;
-    private final SshClientService sshClientService; // seu serviço que executa comandos via SSH
     private final Duration interval = Duration.ofSeconds(30); // 30s
 
-    public MonitoringService(ThreadPoolTaskScheduler scheduler,
-                             ICasoRepository caseRepository,
-                             SshClientService sshClientService) {
-        this.scheduler = scheduler;
-        this.casoRepository = caseRepository;
-        this.sshClientService = sshClientService;
-    }
+    public void startMonitoring(Long casoId) {
+        // evita duplicatas
+        if (tasks.containsKey(casoId)) return;
 
-    public void startMonitoring(Long caseId) {
-        // evita duplicata
-        if (tasks.containsKey(caseId)) return;
-
-        Runnable task = createMonitorTask(caseId);
-
-        // scheduleWithFixedDelay: executa a cada interval após término da execução anterior
+        Runnable task = createTask(casoId);
         ScheduledFuture<?> future = scheduler.scheduleWithFixedDelay(task, interval.toMillis());
-        tasks.put(caseId, future);
+        tasks.put(casoId, future);
     }
 
-    public void stopMonitoring(Long caseId) {
-        ScheduledFuture<?> f = tasks.remove(caseId);
+    public void stopMonitoring(Long casoId) {
+        ScheduledFuture<?> f = tasks.remove(casoId);
         if (f != null) {
             f.cancel(true);
         }
     }
 
-    private Runnable createMonitorTask(Long caseId) {
+    private Runnable createTask(Long casoId) {
         return () -> {
             try {
-                Optional<Caso> opt = casoRepository.findById(caseId);
-                if (opt.isEmpty()) {
-                    stopMonitoring(caseId);
+                Optional<Caso> oCaso = casoRepository.findById(casoId);
+                if (oCaso.isEmpty()) {
+                    stopMonitoring(casoId);
                     return;
                 }
 
-                Caso c = opt.get();
-
-                // se já finalizado, cancela
-                if (c.getStatus() == StatusEnum.FINALIZADO) {
-                    stopMonitoring(caseId);
+                Caso caso = oCaso.get();
+                log.info("Monitorando o caso "+ caso.getIdContainer());
+                // se caso já finalizado, cancela monitor
+                if (caso.getStatus() == StatusEnum.FINALIZADO || caso.getStatus() == StatusEnum.ERROR) {
+                    stopMonitoring(casoId);
                     return;
                 }
 
-                // 1) ler pid.lock remoto (ou containerId se você já salvou)
-                String pidLockPath = c.getPath();
-                String pidLockCmd = "cat " + escapeShellArgument(pidLockPath.endsWith("/") ? pidLockPath + "pid.lock" : pidLockPath + "/pid.lock");
-
-                SshResult pidRes = sshClientService.exec(c.getHost(), c.getPort(), c.getUser(), pidLockCmd);
-                String containerId = null;
-                if (pidRes != null && pidRes.getExitCode() == 0 && pidRes.getStdout() != null) {
-                    containerId = pidRes.getStdout().trim().split("\\r?\\n")[0].trim();
-                    if (!containerId.isEmpty()) {
-                        // grava containerId se ainda não estiver salvo
-                        if (!Objects.equals(c.getContainerId(), containerId)) {
-                            c.setContainerId(containerId);
-                            casoRepository.save(c);
-                        }
-                    }
-                }
-
-                if (containerId == null || containerId.isEmpty()) {
-                    // não achou pid.lock — política: marcar FAILED ou esperar mais
-                    // Aqui vamos apenas logar e aguardar próxima execução
+                String containerId = caso.getIdContainer();
+                if (containerId == null || containerId.trim().isEmpty()) {
+                    // idContainer ainda não preenchido — aguarda próxima rodada
                     return;
                 }
 
-                // 2) checar se container está rodando
-                String inspectCmd = "docker inspect -f '{{.State.Running}}' " + escapeShellArgument(containerId);
-                SshResult inspectRes = sshClientService.exec(c.getHost(), c.getPort(), c.getUser(), inspectCmd);
-
+                // verifica se o container está rodando (delegado à implementação de SshClientService)
                 boolean running = false;
-                if (inspectRes != null && inspectRes.getExitCode() == 0 && inspectRes.getStdout() != null) {
-                    running = "true".equals(inspectRes.getStdout().trim());
+                try {
+                    running = sshClientService.isContainerRunning(containerId);
+                } catch (Exception e) {
+                    // log warning e aguarda próxima rodada (não cancela)
+                    // logger.warn("Erro checando container {}: {}", containerId, e.getMessage(), e);
+                    return;
                 }
 
                 if (running) {
-                    // opcional: atualizar status se necessário
-                    if (c.getStatus() != StatusEnum.EXECUTANDO) {
-                        c.setStatus(StatusEnum.EXECUTANDO);
-                        casoRepository.save(c);
+                    if (caso.getStatus() != StatusEnum.EXECUTANDO) {
+                        caso.setStatus(StatusEnum.EXECUTANDO);
+                        casoRepository.save(caso);
                     }
-                    // container ainda ativo -> nada mais a fazer
+                    // ainda em execução — aguarda próxima verificação
                     return;
                 } else {
-                    // container não está rodando → pegar exit code e finalizar
-                    String exitCmd = "docker inspect -f '{{.State.ExitCode}}' " + escapeShellArgument(containerId);
-                    SshResult exitRes = sshClientService.exec(c.getHost(), c.getPort(), c.getUser(), exitCmd);
-                    int exitCode = -999;
-                    if (exitRes != null && exitRes.getExitCode() == 0 && exitRes.getStdout() != null) {
-                        try { exitCode = Integer.parseInt(exitRes.getStdout().trim()); } catch (Exception ignored) {}
+                    // container não está rodando → obter exit code e finalizar caso
+                    Integer exitCode = null;
+                    try {
+                        exitCode = sshClientService.getContainerExitCode(containerId);
+                    } catch (Exception e) {
+                        // se não conseguiu obter exit code, marca como FAILED por segurança
+                        exitCode = null;
                     }
 
-                    // atualiza status conforme exit code
-                    if (exitCode == 0) c.setStatus(StatusEnum.FINISHED);
-                    else c.setStatus(StatusEnum.FAILED);
-
-                    c.setContainerId(containerId);
-                    casoRepository.save(c);
-
-                    // cancela monitor
-                    stopMonitoring(caseId);
+                    if (exitCode != null && exitCode == 0) {
+                        caso.setStatus(StatusEnum.FINALIZADO);
+                    } else {
+                        caso.setStatus(StatusEnum.ERROR);
+                    }
+                    // salva e cancela monitor
+                    casoRepository.save(caso);
+                    stopMonitoring(casoId);
                 }
 
             } catch (Exception e) {
-                // logue e continue; não interrompa scheduling global
-                // use seu logger: log.warn("Erro no monitor {}: {}", caseId, e.getMessage(), e);
+                // não deixe a exceção quebrar o scheduler; apenas log e continue
+                // logger.error("Erro no monitor caso {}: {}", casoId, e.getMessage(), e);
             }
         };
-    }
-
-    private static String escapeShellArgument(String s) {
-        // forma simples de escapar aspas - customize conforme necessidade
-        return "'" + s.replace("'", "'\"'\"'") + "'";
     }
 }
 

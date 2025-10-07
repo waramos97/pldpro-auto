@@ -8,22 +8,26 @@ public class Caso {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
-    Long id;
+    private Long id;
 
     @Column(name = "idContainer", nullable = false, length = 50)
-    String idContainer;
+    private String idContainer;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false, length = 50)
-    StatusEnum status;
+    private StatusEnum status;
 
-    public Caso() {
-    }
+    @ManyToOne
+    @JoinColumn(name = "host_id")
+    private Host host;
 
-    public Caso(Long id, String idContainer, StatusEnum status) {
+    public Caso() {}
+
+    public Caso(Long id, String idContainer, StatusEnum status, Host host) {
         this.id = id;
         this.idContainer = idContainer;
         this.status = status;
+        this.host = host;
     }
 
     public Long getId() {

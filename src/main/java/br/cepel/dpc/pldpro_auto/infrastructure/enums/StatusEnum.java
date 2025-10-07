@@ -2,6 +2,7 @@ package br.cepel.dpc.pldpro_auto.infrastructure.enums;
 
 public enum StatusEnum {
     EXECUTANDO("executando"),
+    ERROR("error"),
     FINALIZADO("finalizado");
 
     private String label;
